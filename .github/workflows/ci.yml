@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout main honker
+        uses: actions/checkout@v4
+        with:
+          repository: russellromney/honker
+          path: main
+
+      - name: Prep submodule path
+        run: rm -rf main/packages/honker-bun
+      - name: Checkout honker-bun PR
+        uses: actions/checkout@v4
+        with:
+          path: main/packages/honker-bun
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: main
+
+      - name: Build honker extension
+        working-directory: main
+        run: cargo build --release -p honker-extension
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install deps
+        working-directory: main/packages/honker-bun
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Run tests
+        working-directory: main/packages/honker-bun
+        run: bun test
