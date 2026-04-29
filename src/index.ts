@@ -7,7 +7,7 @@
  *
  * Pass 1 notes:
  *   - Async iterators (listen, stream subscribe, claimWaker) are
- *     poll-based on a short timer. A WAL-driven waker is on the
+ *     poll-based on a short timer. An update watcher is on the
  *     roadmap.
  */
 
@@ -424,7 +424,7 @@ export class Queue {
 
   /**
    * Returns a ClaimWaker that polls for jobs with a short timer.
-   * Pass 1: poll-based (no WAL waker yet).
+   * Pass 1: poll-based (no update watcher yet).
    */
   claimWaker(opts: { pollMs?: number } = {}): ClaimWaker {
     return new ClaimWaker(this, opts.pollMs ?? 100);
