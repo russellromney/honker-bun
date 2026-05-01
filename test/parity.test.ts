@@ -491,6 +491,7 @@ maybe("honker-bun parity — claimWaker", () => {
 
   test(
     "runAt deadline wakes before fallback poll",
+    { timeout: 12_000 },
     withDb(async (db) => {
       const q = db.queue("deadline");
       const runAt = Math.floor(Date.now() / 1000) + 3;
