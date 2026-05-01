@@ -53,11 +53,11 @@ Today:
 - Notify/listen across processes on one `.db` file
 - Work queues with retries, priority, delayed jobs, and a dead-letter table
 - Any send can be atomic with your business write (commit together or roll back together)
-- Cross-process coordination without a broker; Bun async iterators are
-  poll-based today
+- Cross-process coordination without a broker
 - Handler timeouts, declarative retries with exponential backoff
 - Delayed jobs, task expiration, named locks, rate-limiting
-- Time-trigger scheduling with a leader-elected scheduler
+- Time-trigger scheduling with a leader-elected scheduler, including
+  every-second schedules
 - Opt-in task result storage (`enqueue` returns an id, worker persists the
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
@@ -84,7 +84,7 @@ with db.transaction() as tx:
     emails.enqueue({"to": "alice@example.com"}, tx=tx)   # atomic with order
 
 # Then in a worker, do: 
-async for job in emails.claim("worker-1"):               # wakes on any database update
+async for job in emails.claim("worker-1"):               # wakes on updates or due deadlines
     try:
         send(job.payload); job.ack()
     except Exception as e:
@@ -246,7 +246,8 @@ Partial-index on state means the claim hot path is bounded by the *working-set* 
 
 - `async for job in q.claim(id)` yields one job at a time via `claim_batch(id, 1)`
 - `Job.ack()` is one `DELETE` in its own transaction. Return is an honest bool: `True` iff the claim was still valid, `False` if the visibility window elapsed and another worker reclaimed.
-- Bun polls for claimable work on a short interval.
+- `claim()` waits on database updates or the next `run_at` / reclaim
+  deadline; a short idle poll is only the fallback.
 
 For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.ack_batch(ids, worker_id)`. The library doesn't hide batching behind the iterator. The per-tx cost and the at-most-once visibility semantics are easier to reason about when the API doesn't try to be clever.
 
