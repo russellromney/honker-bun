@@ -457,7 +457,7 @@ maybe("honker-bun parity — claimWaker", () => {
     "next() wakes eventually on enqueue",
     withDb(async (db) => {
       const q = db.queue("emails");
-      const waker = q.claimWaker({ pollMs: 25 });
+      const waker = q.claimWaker({ idlePollS: 5 });
       const ctl = new AbortController();
       const jobP = waker.next("worker-1", { signal: ctl.signal });
 
@@ -477,10 +477,33 @@ maybe("honker-bun parity — claimWaker", () => {
     "close() resolves pending next() to null",
     withDb(async (db) => {
       const q = db.queue("empty");
-      const waker = q.claimWaker({ pollMs: 25 });
+      const waker = q.claimWaker({ idlePollS: 5 });
       const p = waker.next("w");
       waker.close();
       expect(await p).toBeNull();
+    }),
+  );
+
+  test(
+    "runAt deadline wakes before fallback poll",
+    withDb(async (db) => {
+      const q = db.queue("deadline");
+      const runAt = Math.floor(Date.now() / 1000) + 2;
+      const msUntilDue = runAt * 1000 - Date.now();
+      q.enqueue({ hello: "future" }, { runAt });
+      const waker = q.claimWaker({ idlePollS: 30 });
+      const t0 = Date.now();
+      const job = await Promise.race([
+        waker.next("worker-1"),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+      ]);
+      const dt = Date.now() - t0;
+      expect(job).not.toBeNull();
+      expect((job!.payload as any).hello).toBe("future");
+      expect(dt).toBeGreaterThanOrEqual(Math.max(0, msUntilDue - 250));
+      expect(dt).toBeLessThanOrEqual(msUntilDue + 2500);
+      job!.ack();
+      waker.close();
     }),
   );
 

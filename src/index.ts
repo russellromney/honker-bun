@@ -5,10 +5,10 @@
  * loadable extension (libhonker_ext.dylib / .so). Each method is
  * essentially one SQL call; no wrapper state beyond the DB handle.
  *
- * Pass 1 notes:
- *   - Async iterators (listen, stream subscribe, claimWaker) are
- *     poll-based on a short timer. An update watcher is on the
- *     roadmap.
+ * This binding uses a lightweight data_version watcher instead of the
+ * Rust-native watcher threads used in some other bindings. So the API
+ * shape matches the rest of the family even though Bun gets there with
+ * a small in-process poll loop.
  */
 
 import { Database as BunDB } from "bun:sqlite";
@@ -139,6 +139,17 @@ interface RawStreamEvent {
   created_at: number;
 }
 
+function firstValue(row: Record<string, unknown> | null | undefined): unknown {
+  if (!row) return null;
+  const keys = Object.keys(row);
+  return keys.length === 0 ? null : row[keys[0]];
+}
+
+function readDataVersion(raw: BunDB): number {
+  const row = raw.query<Record<string, unknown>, []>("PRAGMA data_version").get();
+  return Number(firstValue(row) ?? 0);
+}
+
 // ---------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------
@@ -148,6 +159,8 @@ interface RawStreamEvent {
  * the Honker loadable extension loaded and the schema bootstrapped.
  */
 export class Database {
+  private _eventSeq = 0;
+
   constructor(public readonly raw: BunDB) {}
 
   /** Get a handle to a named queue. */
@@ -168,6 +181,11 @@ export class Database {
     return new Scheduler(this);
   }
 
+  /** Update watcher facade used by higher-level waits in this binding. */
+  updateEvents(): UpdateEvents {
+    return new UpdateEvents(this);
+  }
+
   /**
    * Fire a pg_notify-style pub/sub signal. Payload is any
    * JSON-serializable value. Returns the notification id.
@@ -184,6 +202,7 @@ export class Database {
     const row = (opts.tx ? opts.tx.raw : this.raw)
       .query<{ v: number }, [string, string]>("SELECT notify(?, ?) AS v")
       .get(channel, json)!;
+    if (!opts.tx) this._markUpdated();
     return row.v;
   }
 
@@ -210,7 +229,7 @@ export class Database {
    */
   transaction(): Transaction {
     this.raw.exec("BEGIN IMMEDIATE");
-    return new Transaction(this.raw);
+    return new Transaction(this, this.raw);
   }
 
   /** Try to acquire an advisory lock. Returns a Lock or null. */
@@ -265,6 +284,14 @@ export class Database {
   close(): void {
     this.raw.close();
   }
+
+  _markUpdated(): void {
+    this._eventSeq += 1;
+  }
+
+  _eventSnapshot(): number {
+    return this._eventSeq;
+  }
 }
 
 /** Open (or create) a SQLite DB, load the Honker extension, bootstrap. */
@@ -307,7 +334,10 @@ const txFinalizer = new FinalizationRegistry<{
 export class Transaction {
   private doneRef = { done: false };
 
-  constructor(public readonly raw: BunDB) {
+  constructor(
+    private readonly db: Database,
+    public readonly raw: BunDB,
+  ) {
     txFinalizer.register(this, { raw, doneRef: this.doneRef }, this);
   }
 
@@ -332,6 +362,7 @@ export class Transaction {
     this.raw.exec("COMMIT");
     this.doneRef.done = true;
     txFinalizer.unregister(this);
+    this.db._markUpdated();
   }
 
   /** Roll back. Idempotent — subsequent calls are no-ops. */
@@ -351,6 +382,37 @@ export class Transaction {
 // ---------------------------------------------------------------------
 // Queues
 // ---------------------------------------------------------------------
+
+export class UpdateEvents {
+  private closed = false;
+  private lastDataVersion: number;
+  private lastEventSeq: number;
+
+  constructor(
+    private readonly db: Database,
+    private readonly pollMs: number = 50,
+  ) {
+    this.lastDataVersion = readDataVersion(db.raw);
+    this.lastEventSeq = db._eventSnapshot();
+  }
+
+  async next(signal?: AbortSignal): Promise<void> {
+    while (!this.closed && !signal?.aborted) {
+      const dataVersion = readDataVersion(this.db.raw);
+      const eventSeq = this.db._eventSnapshot();
+      if (dataVersion !== this.lastDataVersion || eventSeq !== this.lastEventSeq) {
+        this.lastDataVersion = dataVersion;
+        this.lastEventSeq = eventSeq;
+        return;
+      }
+      await sleep(this.pollMs, signal);
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
 
 export class Queue {
   constructor(
@@ -387,6 +449,7 @@ export class Queue {
         this.opts.maxAttempts,
         opts.expires ?? null,
       )!;
+    if (!opts.tx) this.db._markUpdated();
     return row.v;
   }
 
@@ -422,15 +485,31 @@ export class Queue {
     const row = this.db.raw
       .query<{ v: number }, [string]>("SELECT honker_sweep_expired(?) AS v")
       .get(this.name)!;
+    this.db._markUpdated();
     return row.v;
   }
 
+  nextClaimAt(): number | null {
+    const row = this.db.raw
+      .query<{ v: number | null }, [string]>(
+        "SELECT honker_queue_next_claim_at(?) AS v",
+      )
+      .get(this.name)!;
+    return row.v ?? null;
+  }
+
+  dbHandle(): Database {
+    return this.db;
+  }
+
   /**
-   * Returns a ClaimWaker that polls for jobs with a short timer.
-   * Pass 1: poll-based (no update watcher yet).
+   * Returns a ClaimWaker that waits on DB updates or the next claim
+   * deadline, with a fallback poll.
    */
-  claimWaker(opts: { pollMs?: number } = {}): ClaimWaker {
-    return new ClaimWaker(this, opts.pollMs ?? 100);
+  claimWaker(opts: { idlePollS?: number; pollMs?: number } = {}): ClaimWaker {
+    const idlePollMs =
+      opts.idlePollS != null ? Math.max(0, opts.idlePollS * 1000) : opts.pollMs ?? 5000;
+    return new ClaimWaker(this, idlePollMs);
   }
 }
 
@@ -455,44 +534,52 @@ export class Job {
 
   /** DELETE the row if the claim is still valid. */
   ack(): boolean {
-    return (
+    const ok = (
       this.db.raw
         .query<{ v: number }, [number, string]>("SELECT honker_ack(?, ?) AS v")
         .get(this.id, this.workerId)!.v > 0
     );
+    if (ok) this.db._markUpdated();
+    return ok;
   }
 
   /** Put the job back with a delay, or move to dead after maxAttempts. */
   retry(delaySec: number, errorMsg: string): boolean {
-    return (
+    const ok = (
       this.db.raw
         .query<{ v: number }, [number, string, number, string]>(
           "SELECT honker_retry(?, ?, ?, ?) AS v",
         )
         .get(this.id, this.workerId, delaySec, errorMsg)!.v > 0
     );
+    if (ok) this.db._markUpdated();
+    return ok;
   }
 
   /** Unconditionally move to dead. */
   fail(errorMsg: string): boolean {
-    return (
+    const ok = (
       this.db.raw
         .query<{ v: number }, [number, string, string]>(
           "SELECT honker_fail(?, ?, ?) AS v",
         )
         .get(this.id, this.workerId, errorMsg)!.v > 0
     );
+    if (ok) this.db._markUpdated();
+    return ok;
   }
 
   /** Extend the visibility timeout. */
   heartbeat(extendSec: number): boolean {
-    return (
+    const ok = (
       this.db.raw
         .query<{ v: number }, [number, string, number]>(
           "SELECT honker_heartbeat(?, ?, ?) AS v",
         )
         .get(this.id, this.workerId, extendSec)!.v > 0
     );
+    if (ok) this.db._markUpdated();
+    return ok;
   }
 }
 
@@ -502,11 +589,14 @@ export class Job {
  */
 export class ClaimWaker {
   private stopped = false;
+  private readonly updates: UpdateEvents;
 
   constructor(
     private readonly queue: Queue,
-    private readonly pollMs: number,
-  ) {}
+    private readonly idlePollMs: number,
+  ) {
+    this.updates = queue.dbHandle().updateEvents();
+  }
 
   /** Claim one job without blocking. Null if the queue is empty. */
   tryNext(workerId: string): Job | null {
@@ -524,7 +614,12 @@ export class ClaimWaker {
     while (!this.stopped && !opts.signal?.aborted) {
       const job = this.queue.claimOne(workerId);
       if (job) return job;
-      await sleep(this.pollMs, opts.signal);
+      const nextClaimAt = this.queue.nextClaimAt();
+      let waitMs = this.idlePollMs;
+      if (nextClaimAt && nextClaimAt > 0) {
+        waitMs = Math.min(waitMs, Math.max(0, nextClaimAt * 1000 - Date.now()));
+      }
+      await waitForUpdateOrTimeout(this.updates, opts.signal, waitMs);
     }
     return null;
   }
@@ -532,6 +627,7 @@ export class ClaimWaker {
   /** Stop any in-flight `next()` calls (they resolve to null). */
   close(): void {
     this.stopped = true;
+    this.updates.close();
   }
 }
 
@@ -571,6 +667,7 @@ export class Stream {
         "SELECT honker_stream_publish(?, ?, ?) AS v",
       )
       .get(this.topic, key, json)!;
+    if (conn === this.db.raw) this.db._markUpdated();
     return row.v;
   }
 
@@ -592,7 +689,9 @@ export class Stream {
 
   /** Monotonic: saving a lower offset is a no-op. Returns true if saved. */
   saveOffset(consumer: string, offset: number): boolean {
-    return this.saveOffsetImpl(consumer, offset, this.db.raw);
+    const ok = this.saveOffsetImpl(consumer, offset, this.db.raw);
+    if (ok) this.db._markUpdated();
+    return ok;
   }
 
   /** Save offset inside an open transaction. */
@@ -634,6 +733,8 @@ export class Stream {
     consumer: string,
     opts: {
       saveEveryN?: number;
+      saveEveryS?: number;
+      idlePollS?: number;
       pollMs?: number;
       signal?: AbortSignal;
     } = {},
@@ -642,9 +743,14 @@ export class Stream {
       this,
       consumer,
       opts.saveEveryN ?? 1000,
-      opts.pollMs ?? 100,
+      opts.saveEveryS ?? 1,
+      opts.idlePollS != null ? Math.max(0, opts.idlePollS * 1000) : opts.pollMs ?? 5000,
       opts.signal,
     );
+  }
+
+  dbHandle(): Database {
+    return this.db;
   }
 }
 
@@ -662,47 +768,55 @@ async function* subscribeImpl(
   stream: Stream,
   consumer: string,
   saveEveryN: number,
-  pollMs: number,
+  saveEveryS: number,
+  idlePollMs: number,
   signal?: AbortSignal,
 ): AsyncIterableIterator<StreamEvent> {
   let lastOffset = stream.getOffset(consumer);
   let lastSaved = lastOffset;
+  let lastSaveAt = Date.now();
+  const updates = stream.dbHandle().updateEvents();
   const flush = () => {
-    if (saveEveryN > 0 && lastOffset > lastSaved) {
+    if ((saveEveryN > 0 || saveEveryS > 0) && lastOffset > lastSaved) {
       stream.saveOffset(consumer, lastOffset);
       lastSaved = lastOffset;
+      lastSaveAt = Date.now();
     }
   };
   try {
     while (!signal?.aborted) {
       const events = stream.readSince(lastOffset, 100);
       if (events.length === 0) {
-        await sleep(pollMs, signal);
+        await waitForUpdateOrTimeout(updates, signal, idlePollMs);
         continue;
       }
       for (const ev of events) {
         yield ev;
         lastOffset = ev.offset;
-        if (saveEveryN > 0 && lastOffset - lastSaved >= saveEveryN) {
+        const enoughEvents = saveEveryN > 0 && lastOffset - lastSaved >= saveEveryN;
+        const enoughTime = saveEveryS > 0 && Date.now() - lastSaveAt >= saveEveryS * 1000;
+        if (enoughEvents || enoughTime) {
           stream.saveOffset(consumer, lastOffset);
           lastSaved = lastOffset;
+          lastSaveAt = Date.now();
         }
       }
     }
   } finally {
+    updates.close();
     flush();
   }
 }
 
 // ---------------------------------------------------------------------
-// Pub/sub listen (poll-based Pass 1)
+// Pub/sub listen
 // ---------------------------------------------------------------------
 
 async function* listenImpl(
   db: Database,
   channel: string,
   signal: AbortSignal | undefined,
-  pollMs: number,
+  idlePollMs: number,
 ): AsyncIterableIterator<Notification> {
   const startId = db.raw
     .query<{ v: number }, []>(
@@ -717,10 +831,11 @@ async function* listenImpl(
     "SELECT id, channel, payload FROM _honker_notifications " +
       "WHERE id > ? AND channel = ? ORDER BY id ASC LIMIT 1000",
   );
+  const updates = db.updateEvents();
   while (!signal?.aborted) {
     const rows = stmt.all(lastId, channel);
     if (rows.length === 0) {
-      await sleep(pollMs, signal);
+      await waitForUpdateOrTimeout(updates, signal, idlePollMs);
       continue;
     }
     for (const r of rows) {
@@ -732,6 +847,7 @@ async function* listenImpl(
       };
     }
   }
+  updates.close();
 }
 
 // ---------------------------------------------------------------------
@@ -741,7 +857,6 @@ async function* listenImpl(
 const SCHEDULER_LOCK = "honker-scheduler";
 const SCHEDULER_LOCK_TTL_S = 60;
 const SCHEDULER_HEARTBEAT_MS = 20_000;
-const SCHEDULER_TICK_MS = 1_000;
 const SCHEDULER_STANDBY_MS = 5_000;
 
 export class Scheduler {
@@ -767,6 +882,7 @@ export class Scheduler {
         task.priority ?? 0,
         task.expiresS ?? null,
       );
+    this.db._markUpdated();
   }
 
   /** Unregister a task by name. Returns rows deleted. */
@@ -776,6 +892,7 @@ export class Scheduler {
         "SELECT honker_scheduler_unregister(?) AS v",
       )
       .get(name)!;
+    this.db._markUpdated();
     return row.v;
   }
 
@@ -787,7 +904,9 @@ export class Scheduler {
         "SELECT honker_scheduler_tick(?) AS v",
       )
       .get(now)!;
-    return JSON.parse(row.v) as ScheduledFire[];
+    const fires = JSON.parse(row.v) as ScheduledFire[];
+    if (fires.length > 0) this.db._markUpdated();
+    return fires;
   }
 
   /** Soonest `next_fire_at` across all tasks, or 0 if none. */
@@ -808,6 +927,7 @@ export class Scheduler {
    */
   async run(opts: { owner: string; signal: AbortSignal }): Promise<void> {
     const { owner, signal } = opts;
+    const updates = this.db.updateEvents();
     while (!signal.aborted) {
       const lock = this.db.tryLock(
         SCHEDULER_LOCK,
@@ -815,22 +935,28 @@ export class Scheduler {
         SCHEDULER_LOCK_TTL_S,
       );
       if (!lock) {
-        await sleep(SCHEDULER_STANDBY_MS, signal);
+        await waitForUpdateOrTimeout(updates, signal, SCHEDULER_STANDBY_MS);
         continue;
       }
       try {
-        await this.leaderLoop(lock, signal);
+        await this.leaderLoop(lock, signal, updates);
       } catch (err) {
         // release then rethrow so a standby can take over immediately
         lock.release();
+        updates.close();
         throw err;
       }
       // Normal exit (stopped or lost the lock) — release if still held.
       lock.release();
     }
+    updates.close();
   }
 
-  private async leaderLoop(lock: Lock, signal: AbortSignal): Promise<void> {
+  private async leaderLoop(
+    lock: Lock,
+    signal: AbortSignal,
+    updates: UpdateEvents,
+  ): Promise<void> {
     let lastHeartbeat = Date.now();
     while (!signal.aborted) {
       this.tick();
@@ -840,7 +966,12 @@ export class Scheduler {
         if (!stillOurs) return; // lost — exit leader loop, re-contest
         lastHeartbeat = now;
       }
-      await sleep(SCHEDULER_TICK_MS, signal);
+      let waitMs = Math.max(0, SCHEDULER_HEARTBEAT_MS - (Date.now() - lastHeartbeat));
+      const nextFire = this.soonest();
+      if (nextFire && nextFire > 0) {
+        waitMs = Math.min(waitMs, Math.max(0, nextFire * 1000 - Date.now()));
+      }
+      await waitForUpdateOrTimeout(updates, signal, waitMs);
     }
   }
 }
@@ -934,6 +1065,34 @@ export class Lock {
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
+
+async function waitForUpdateOrTimeout(
+  updates: UpdateEvents,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  const ms = Math.max(0, timeoutMs);
+  const inner = new AbortController();
+  const forwardAbort = () => inner.abort();
+  signal?.addEventListener("abort", forwardAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      updates.next(inner.signal),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          inner.abort();
+          resolve();
+        }, ms);
+      }),
+      abortPromise(signal).then(() => undefined),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", forwardAbort);
+    inner.abort();
+  }
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
