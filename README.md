@@ -9,7 +9,8 @@ honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus 
 `honker` works by storing queues, notifications, streams, locks, and
 scheduler state in the same SQLite file as your application data. This
 Bun binding is currently a thin extension wrapper; its async iterators
-use short timer polling until it grows the shared update watcher used by
+use a lightweight `PRAGMA data_version` watcher plus deadline waits, rather than the
+native watcher-thread bridge used by
 the Rust, Python, Node, Go, and C++ bindings.
 
 > Experimental. API may change.
@@ -90,7 +91,7 @@ async for job in emails.claim("worker-1"):               # wakes on any database
         job.retry(delay_s=60, error=str(e))
 ```
 
-`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. In Bun it polls on a short interval; the shared update watcher is still future work for this binding. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
+`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. In Bun it waits on a lightweight `PRAGMA data_version` watcher plus the next claim-relevant deadline, with a fallback idle poll. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
 
 ### Python: tasks (Huey-style decorators)
 
@@ -208,13 +209,13 @@ The explicit goal is to do `NOTIFY`/`LISTEN` semantics without constant polling,
 
 ### WAL is the recommended default
 
-The language bindings default to `journal_mode = WAL` because it gives concurrent readers with one writer and efficient fsync batching (`wal_autocheckpoint = 10000`). Other modes (DELETE, TRUNCATE, MEMORY) still work. The shared update watcher used by the Rust, Python, Node, Go, and C++ bindings polls `PRAGMA data_version`, which increments on every commit in every journal mode and is visible across processes. Bun does not use that watcher yet; its async iterators poll their target tables directly.
+The language bindings default to `journal_mode = WAL` because it gives concurrent readers with one writer and efficient fsync batching (`wal_autocheckpoint = 10000`). Other modes (DELETE, TRUNCATE, MEMORY) still work. The wake path is `PRAGMA data_version`, which increments on every commit in every journal mode and is visible across processes. Bun uses a lightweight in-process watcher built on that counter rather than the native watcher-thread bridge used by some other bindings.
 
 The library/extension is a small coordination layer built on the properties of SQLite and single-server architecture.
 
 - One `.db` is the entire system (plus `.db-wal` / `.db-shm` sidecars if you've opted into WAL). You get every benefit of SQLite (embedded, local, durable, snapshot-able) that your app already uses.
 - Claim is one `UPDATE … RETURNING` via a partial index; ack is one `DELETE`. One writer at a time no matter the journal mode; concurrent readers come with WAL.
-- Rust, Python, Node, Go, and C++ poll `PRAGMA data_version` every 1 ms to detect commits from any connection in any journal mode. Bun's pass-1 implementation polls target tables on a short timer.
+- Rust, Python, Node, Go, and C++ poll `PRAGMA data_version` every 1 ms to detect commits from any connection in any journal mode. Bun uses the same counter, but via a lightweight in-process watcher instead of the native bridge thread used by some other bindings.
 - SQLite has no wire protocol. Consumers must initiate reads; server-push is impossible. Wake signal = counter increment → `SELECT`.
 - Transactions are cheap, so jobs, events, and notifications are rows in the caller's open `with db.transaction()` block in an "outbox"-type pattern.
 - Single machine, single writer. SQLite's locking is designed for a single host. Two servers writing one `.db` over NFS will corrupt it. Shard by file, or switch to Postgres.
@@ -224,12 +225,12 @@ The library/extension is a small coordination layer built on the properties of S
 ### Wake path
 
 - Rust, Python, Node, Go, and C++ use one PRAGMA-poll update watcher per `Database`
-- Bun's pass-1 async iterators poll their target table on a short timer
+- Bun also uses one watcher per `Database`, but keeps it fully inside the Bun binding instead of going through the native bridge thread
 - Each subscriber runs `SELECT … WHERE id > last_seen` against a partial index, yields rows, returns to wait
 
 For the bindings with an update watcher, idle cost is a single `PRAGMA data_version` query per millisecond per database. Listener count scales for free because the wake signal is a SQLite counter read instead of a polling query.
 
-`SharedUpdateWatcher` (in `honker-core`) owns the poll thread for the Rust/Python/Node path and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Bun still needs a bridge to that watcher.
+`SharedUpdateWatcher` (in `honker-core`) owns the poll thread for the Rust/Python/Node path and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Bun currently reaches the same `PRAGMA data_version` wake semantics with its own lightweight binding-local watcher instead of that bridge.
 
 ### Queue schema
 

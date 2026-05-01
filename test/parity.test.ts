@@ -14,6 +14,8 @@ const EXT_CANDIDATES = [
 ];
 
 function findExtension(): string | null {
+  const fromEnv = process.env.HONKER_EXT_PATH;
+  if (fromEnv && existsSync(fromEnv)) return fromEnv;
   for (const rel of EXT_CANDIDATES) {
     const p = join(REPO_ROOT, rel);
     if (existsSync(p)) return p;
@@ -22,6 +24,9 @@ function findExtension(): string | null {
 }
 
 const extPath = findExtension();
+if (!extPath && process.env.CI) {
+  throw new Error("HONKER_EXT_PATH not found in CI; Bun tests must run for real");
+}
 const maybe = extPath ? describe : describe.skip;
 
 // Shared setup helper. Each `test` creates its own tempdir + db.
