@@ -92,7 +92,10 @@ export interface OpenOptions {
 export interface ScheduledTask {
   name: string;
   queue: string;
-  cron: string;
+  /** Canonical recurring schedule expression. */
+  schedule?: string;
+  /** Backward-compatible alias for `schedule`. */
+  cron?: string;
   payload: unknown;
   priority?: number;
   expiresS?: number | null;
@@ -744,8 +747,10 @@ const SCHEDULER_STANDBY_MS = 5_000;
 export class Scheduler {
   constructor(private readonly db: Database) {}
 
-  /** Register a cron task. Idempotent by name. */
+  /** Register a recurring scheduled task. Idempotent by name. */
   add(task: ScheduledTask): void {
+    const expr = task.schedule ?? task.cron;
+    if (!expr) throw new Error("must provide schedule or cron");
     const payloadJson = JSON.stringify(task.payload);
     this.db.raw
       .query<
@@ -757,7 +762,7 @@ export class Scheduler {
       .get(
         task.name,
         task.queue,
-        task.cron,
+        expr,
         payloadJson,
         task.priority ?? 0,
         task.expiresS ?? null,

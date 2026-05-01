@@ -56,7 +56,7 @@ Today:
   poll-based today
 - Handler timeouts, declarative retries with exponential backoff
 - Delayed jobs, task expiration, named locks, rate-limiting
-- Crontab-style periodic tasks with a leader-elected scheduler
+- Time-trigger scheduling with a leader-elected scheduler
 - Opt-in task result storage (`enqueue` returns an id, worker persists the
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval

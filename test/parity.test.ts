@@ -195,7 +195,7 @@ maybe("honker-bun parity — Scheduler", () => {
       sc.add({
         name: "hourly",
         queue: "reports",
-        cron: "0 * * * *",
+        schedule: "0 * * * *",
         payload: { kind: "hourly" },
       });
       expect(sc.remove("hourly")).toBe(1);
@@ -212,7 +212,7 @@ maybe("honker-bun parity — Scheduler", () => {
       sc.add({
         name: "every-min",
         queue: "pings",
-        cron: "* * * * *",
+        schedule: "* * * * *",
         payload: {},
       });
       // Initial tick may or may not fire depending on boundary timing;
@@ -231,7 +231,7 @@ maybe("honker-bun parity — Scheduler", () => {
       sc.add({
         name: "abort-me",
         queue: "q",
-        cron: "0 0 1 1 *", // Jan 1 midnight — never inside our 200ms window
+        schedule: "0 0 1 1 *", // Jan 1 midnight — never inside our 200ms window
         payload: {},
       });
       const ctl = new AbortController();
@@ -244,6 +244,36 @@ maybe("honker-bun parity — Scheduler", () => {
       const lock = db.tryLock("honker-scheduler", "leader-2", 30);
       expect(lock).not.toBeNull();
       lock?.release();
+    }),
+  );
+
+  test(
+    "legacy cron alias still works",
+    withDb((db) => {
+      const sc = db.scheduler();
+      sc.add({
+        name: "legacy",
+        queue: "reports",
+        cron: "@every 1s",
+        payload: { kind: "legacy" },
+      });
+      expect(sc.soonest()).toBeGreaterThanOrEqual(0);
+      expect(sc.remove("legacy")).toBe(1);
+    }),
+  );
+
+  test(
+    "every-second schedule is accepted",
+    withDb((db) => {
+      const sc = db.scheduler();
+      sc.add({
+        name: "fast",
+        queue: "reports",
+        schedule: "@every 1s",
+        payload: { kind: "fast" },
+      });
+      expect(sc.soonest()).toBeGreaterThanOrEqual(0);
+      expect(sc.remove("fast")).toBe(1);
     }),
   );
 });
